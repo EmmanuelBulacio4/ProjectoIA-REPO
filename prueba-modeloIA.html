@@ -240,8 +240,7 @@
                 // El modelo recibe un tensor float32 con forma [1, 480, 640, 3].
                 inputTensor = tf.tidy(() => {
                     const imgData = ctx.getImageData(0, 0, INPUT_WIDTH, INPUT_HEIGHT);
-                    return tf.browser.fromPixels(imgData)
-                        .toFloat()
+                    return tf.cast(tf.browser.fromPixels(imgData), 'float32')
                         .expandDims(0);
                 });
 
