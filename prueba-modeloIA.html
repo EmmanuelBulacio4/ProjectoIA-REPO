@@ -6,8 +6,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>App Bulacio</title>
     <!-- Carga de TensorFlow.js y la librería de compatibilidad TF Lite -->
-    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-cpu"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@3.20.0"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-cpu@3.20.0"></script>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.9/dist/tf-tflite.min.js"></script>
 
     <style>
@@ -167,10 +167,12 @@
 
         let tfliteModel = null;
         let isAnalyzing = false;
+        let cameraStream = null;
+        let analysisInterval = null;
 
         const video = document.getElementById('webcam');
         const canvas = document.getElementById('canvas');
-        const ctx = canvas.getContext('2d');
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
         const startBtn = document.getElementById('start-btn');
         const statusText = document.getElementById('status-text');
         const statusDot = document.getElementById('status-dot');
@@ -178,10 +180,17 @@
         const confidencePara = document.getElementById('confidence');
         const errorMessage = document.getElementById('error-message');
 
+        function showError(error) {
+            const message = error instanceof Error ? error.message : String(error);
+            errorMessage.innerText = `Detalle: ${message}`;
+            errorMessage.hidden = false;
+        }
+
         // 1. Cargar el modelo TF Lite al iniciar
         async function loadModel() {
             try {
-                // Configurar el backend WASM para TF Lite
+                await tf.setBackend('cpu');
+                await tf.ready();
                 tflite.setWasmPath('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.9/dist/');
                 tfliteModel = await tflite.loadTFLiteModel(MODEL_PATH);
 
@@ -191,37 +200,52 @@
             } catch (error) {
                 console.error('Error al cargar el modelo:', error);
                 statusText.innerText = 'Error cargando modelo';
+                showError(error);
             }
         }
 
         // 2. Iniciar la cámara trasera del dispositivo
         async function startCamera() {
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    video: {
-                        facingMode: { exact: "environment" } // Forzar cámara trasera
-                    },
-                    audio: false
-                });
-                video.srcObject = stream;
-                startBtn.style.display = 'none';
+            if (cameraStream || !tfliteModel) return;
 
-                // Iniciar bucle de análisis cada 2 segundos
-                setInterval(analyzeFrame, INTERVAL_MS);
-            } catch (err) {
-                console.warn("No se pudo acceder a la cámara trasera con 'exact', intentando modo fallback:", err);
+            startBtn.disabled = true;
+            errorMessage.hidden = true;
+            try {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    throw new Error('Este navegador no permite acceder a la cámara.');
+                }
+
+                let stream;
                 try {
-                    // Fallback para dispositivos o navegadores que no soportan exact
-                    const stream = await navigator.mediaDevices.getUserMedia({
-                        video: { facingMode: "environment" },
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: { exact: 'environment' } },
                         audio: false
                     });
-                    video.srcObject = stream;
-                    startBtn.style.display = 'none';
-                    setInterval(analyzeFrame, INTERVAL_MS);
-                } catch (fallbackErr) {
-                    alert('Error al acceder a la cámara: ' + fallbackErr.message);
+                } catch (cameraError) {
+                    if (cameraError.name === 'NotAllowedError' || cameraError.name === 'SecurityError') {
+                        throw cameraError;
+                    }
+                    console.warn('No se pudo usar la cámara trasera; intentando la cámara disponible:', cameraError);
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: 'environment' },
+                        audio: false
+                    });
                 }
+
+                cameraStream = stream;
+                video.srcObject = cameraStream;
+                await video.play();
+                startBtn.style.display = 'none';
+                analysisInterval = window.setInterval(analyzeFrame, INTERVAL_MS);
+            } catch (error) {
+                if (cameraStream) {
+                    cameraStream.getTracks().forEach(track => track.stop());
+                    cameraStream = null;
+                }
+                video.srcObject = null;
+                startBtn.disabled = false;
+                statusText.innerText = 'Error al iniciar la cámara';
+                showError(error);
             }
         }
 
@@ -237,11 +261,12 @@
                 // Dibujar el frame en las dimensiones que espera el modelo: 640x480.
                 ctx.drawImage(video, 0, 0, INPUT_WIDTH, INPUT_HEIGHT);
 
-                // El modelo recibe un tensor float32 con forma [1, 480, 640, 3].
+                // El modelo espera float32 normalizado a [-1, 1] con forma [1, 480, 640, 3].
                 inputTensor = tf.tidy(() => {
                     const imgData = ctx.getImageData(0, 0, INPUT_WIDTH, INPUT_HEIGHT);
-                    return tf.cast(tf.browser.fromPixels(imgData), 'float32')
-                        .expandDims(0);
+                    const pixels = tf.cast(tf.browser.fromPixels(imgData), 'float32');
+                    const normalized = tf.sub(tf.div(pixels, 127.5), 1);
+                    return tf.expandDims(normalized, 0);
                 });
 
                 // Ejecutar la inferencia con el archivo .tflite
@@ -274,8 +299,7 @@
             } catch (error) {
                 console.error("Error durante la inferencia:", error);
                 statusText.innerText = 'Error analizando imagen';
-                errorMessage.innerText = `Detalle: ${error instanceof Error ? error.message : String(error)}`;
-                errorMessage.hidden = false;
+                showError(error);
             } finally {
                 if (inputTensor) inputTensor.dispose();
                 if (outputTensor && outputTensor.dispose) outputTensor.dispose();
@@ -286,6 +310,10 @@
         // Eventos
         startBtn.addEventListener('click', startCamera);
         window.addEventListener('load', loadModel);
+        window.addEventListener('beforeunload', () => {
+            if (analysisInterval !== null) window.clearInterval(analysisInterval);
+            if (cameraStream) cameraStream.getTracks().forEach(track => track.stop());
+        });
     </script>
 </body>
 
