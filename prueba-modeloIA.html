@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>App Bulacio</title>
+    <!-- Carga de TensorFlow.js y la librería de compatibilidad TF Lite -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-cpu"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.9/dist/tf-tflite.min.js"></script>
+
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+        }
+
+        body {
+            background-color: #121212;
+            color: #ffffff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+            min-height: 100vh;
+            padding: 16px;
+        }
+
+        h1 {
+            font-size: 1.2rem;
+            margin-bottom: 12px;
+            text-align: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 480px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .video-wrapper {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 4 / 3;
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+        }
+
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .status-badge {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: #ff9800;
+        }
+
+        .dot.active {
+            background-color: #4caf50;
+        }
+
+        .card {
+            width: 100%;
+            background: #1e1e1e;
+            padding: 16px;
+            border-radius: 12px;
+            text-align: center;
+        }
+
+        .result-label {
+            font-size: 2rem;
+            font-weight: bold;
+            margin: 8px 0;
+            text-transform: uppercase;
+        }
+
+        .label-fine {
+            color: #4caf50;
+        }
+
+        .label-hook {
+            color: #2196f3;
+        }
+
+        .btn {
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 1rem;
+            border-radius: 8px;
+            font-weight: bold;
+            cursor: pointer;
+            width: 100%;
+        }
+
+        .btn:disabled {
+            background: #555;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+        <h1>Bien or Hook</h1>
+
+        <div class="video-wrapper">
+            <video id="webcam" autoplay playsinline muted></video>
+            <div class="status-badge">
+                <span id="status-dot" class="dot"></span>
+                <span id="status-text">Cargando modelo...</span>
+            </div>
+        </div>
+
+        <button id="start-btn" class="btn" disabled>Iniciar Cámara</button>
+
+        <div class="card">
+            <h3>Resultado del Análisis</h3>
+            <div id="result" class="result-label">---</div>
+            <p id="confidence">Confianza: 0%</p>
+        </div>
+    </div>
+
+    <!-- Canvas oculto para extraer y reescalar los frames a 480x640 -->
+    <canvas id="canvas" width="480" height="640" style="display:none;"></canvas>
+
+    <script>
+        const LABELS = { 0: 'fine', 1: 'hook' };
+        const MODEL_PATH = "./fine_hook_model.tflite"; // DIRECCION DEL MODELO
+        const INPUT_WIDTH = 480;
+        const INPUT_HEIGHT = 640;
+        const INTERVAL_MS = 500; // ANALIZAR CADA x MILISEG
+
+        let tfliteModel = null;
+        let isAnalyzing = false;
+
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const startBtn = document.getElementById('start-btn');
+        const statusText = document.getElementById('status-text');
+        const statusDot = document.getElementById('status-dot');
+        const resultDiv = document.getElementById('result');
+        const confidencePara = document.getElementById('confidence');
+
+        // 1. Cargar el modelo TF Lite al iniciar
+        async function loadModel() {
+            try {
+                // Configurar el backend WASM para TF Lite
+                tflite.setWasmPath('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.9/dist/');
+                tfliteModel = await tflite.loadTFLiteModel(MODEL_PATH);
+
+                statusText.innerText = 'Modelo listo';
+                statusDot.classList.add('active');
+                startBtn.disabled = false;
+            } catch (error) {
+                console.error('Error al cargar el modelo:', error);
+                statusText.innerText = 'Error cargando modelo';
+            }
+        }
+
+        // 2. Iniciar la cámara trasera del dispositivo
+        async function startCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: { exact: "environment" } // Forzar cámara trasera
+                    },
+                    audio: false
+                });
+                video.srcObject = stream;
+                startBtn.style.display = 'none';
+
+                // Iniciar bucle de análisis cada 2 segundos
+                setInterval(analyzeFrame, INTERVAL_MS);
+            } catch (err) {
+                console.warn("No se pudo acceder a la cámara trasera con 'exact', intentando modo fallback:", err);
+                try {
+                    // Fallback para dispositivos o navegadores que no soportan exact
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: "environment" },
+                        audio: false
+                    });
+                    video.srcObject = stream;
+                    startBtn.style.display = 'none';
+                    setInterval(analyzeFrame, INTERVAL_MS);
+                } catch (fallbackErr) {
+                    alert('Error al acceder a la cámara: ' + fallbackErr.message);
+                }
+            }
+        }
+
+        // 3. Capturar frame, preprocesar e inferir con TFLite
+        async function analyzeFrame() {
+            if (!tfliteModel || isAnalyzing || video.readyState !== 4) return;
+
+            isAnalyzing = true;
+
+            try {
+                // Dibujar el frame del video en el canvas con la dimensión exacta 480x640
+                ctx.drawImage(video, 0, 0, INPUT_WIDTH, INPUT_HEIGHT);
+
+                // Convertir la imagen del canvas a un Tensor de TensorFlow (RGB 0-255)
+                const inputTensor = tf.tidy(() => {
+                    const imgData = ctx.getImageData(0, 0, INPUT_WIDTH, INPUT_HEIGHT);
+                    // Crear tensor de forma [1, 640, 480, 3]
+                    return tf.browser.fromPixels(imgData)
+                        .expandDims(0);
+                });
+
+                // Ejecutar la inferencia con el archivo .tflite
+                const outputTensor = await tfliteModel.predict(inputTensor);
+                const outputData = await outputTensor.data();
+
+                // Procesar resultados (Asumiendo salida Sigmoid para 1 valor o Softmax para 2 valores)
+                let predictedClass = 0;
+                let confidence = 0;
+
+                if (outputData.length === 1) {
+                    // Clasificación binaria con 1 neurona de salida (Sigmoid)
+                    const prob = outputData[0];
+                    predictedClass = prob >= 0.5 ? 1 : 0;
+                    confidence = predictedClass === 1 ? prob : (1 - prob);
+                } else {
+                    // Clasificación binaria con 2 neuronas de salida (Softmax)
+                    predictedClass = outputData[0] > outputData[1] ? 0 : 1;
+                    confidence = outputData[predictedClass];
+                }
+
+                // Mostrar resultados en pantalla
+                const labelName = LABELS[predictedClass];
+                resultDiv.innerText = labelName;
+                resultDiv.className = `result-label label-${labelName}`;
+                confidencePara.innerText = `Confianza: ${(confidence * 100).toFixed(1)}%`;
+
+                // Limpieza de tensores para liberar memoria en dispositivos móviles
+                inputTensor.dispose();
+                if (outputTensor.dispose) outputTensor.dispose();
+
+            } catch (error) {
+                console.error("Error durante la inferencia:", error);
+            } finally {
+                isAnalyzing = false;
+            }
+        }
+
+        // Eventos
+        startBtn.addEventListener('click', startCamera);
+        window.addEventListener('load', loadModel);
+    </script>
+</body>
+
+</html>
